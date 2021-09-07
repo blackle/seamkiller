@@ -5,13 +5,23 @@
  * the input to remove the seams that appear when tiling.
  */
 
-#define GEGL_ITERATOR2_API
 #define GETTEXT_PACKAGE "gtk20"
 #include <glib/gi18n-lib.h>
+#include <math.h>
 
 #ifdef GEGL_PROPERTIES
 
-/* This operation has no properties */
+property_int  (samples, _("RWOS samples"), 100)
+  value_range (1, 500)
+  ui_range    (0, 500)
+  description (_("Number of RWOS samples"))
+
+property_int  (steps, _("RWOS steps"), 50)
+  value_range (1, 100)
+  ui_range    (0, 100)
+  description (_("Number of RWOS steps"))
+
+property_seed (seed, _("Random seed"), rand)
 
 #else
 
@@ -21,86 +31,202 @@
 
 #include "gegl-op.h"
 
-static void
-prepare (GeglOperation *operation)
+static GeglRectangle
+get_effective_area (GeglOperation *operation)
 {
-  const Babl *input_format = gegl_operation_get_source_format (operation, "input");
-  const Babl *format;
+  GeglRectangle  result = {0,0,0,0};
+  GeglRectangle *in_rect = gegl_operation_source_get_bounding_box (operation, "input");
 
-  GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
+  gegl_rectangle_copy(&result, in_rect);
 
-  if (input_format == NULL || babl_format_has_alpha (input_format))
-    format = babl_format_with_space ("R'G'B'A float", input_format);
-  else
-    format = babl_format_with_space ("R'G'B' float", input_format);
-
-  gegl_operation_set_format (operation, "input", format);
-  gegl_operation_set_format (operation, "output", format);
-
-  op_area->left   =
-  op_area->right  =
-  op_area->top    =
-  op_area->bottom = 1;
+  return result;
 }
 
-static GeglRectangle
-get_bounding_box (GeglOperation *operation)
+
+static void
+random_unit_vector(const GeglRandom *rand, gint x, gint y, gint* n, gfloat* rx, gfloat* ry)
 {
-  GeglRectangle *region;
+  gfloat angle = gegl_random_float(rand, x, y, 0, (*n)++) * 2 * 3.14159265f;
+  *rx = cos(angle);
+  *ry = sin(angle);
+}
 
-  region = gegl_operation_source_get_bounding_box (operation, "input");
+static gfloat
+distance_to_rectangle(const GeglRectangle* rect, gfloat x, gfloat y)
+{
+  gfloat xdist = fmin(x - rect->x, rect->x + rect->width - x);
+  gfloat ydist = fmin(y - rect->y, rect->y + rect->height - y);
+  return fmin(ydist, xdist);
+}
 
-  if (region != NULL)
-    return *region;
-  else
-    return *GEGL_RECTANGLE (0, 0, 0, 0);
+static void
+swap(gfloat* a, gfloat* b)
+{
+  gfloat tmp = *a;
+  *a = *b;
+  *b = tmp;
+}
+
+static gboolean
+closest_and_antipode_on_rectangle(const GeglRectangle* rect, gfloat x, gfloat y, gfloat* cx, gfloat* cy, gfloat* ax, gfloat* ay)
+{
+  *cx = *ax = x; *cy = *ay = y;
+  gfloat xdist1 = x - rect->x;
+  gfloat xdist2 = rect->x + rect->width - x;
+  gfloat xdist = fmin(xdist1, xdist2);
+
+  gfloat ydist1 = y - rect->y;
+  gfloat ydist2 = rect->y + rect->height - y;
+  gfloat ydist = fmin(ydist1, ydist2);
+  if (xdist < ydist) {
+    *cx = rect->x;
+    *ax = rect->x + rect->width;
+    if (xdist1 > xdist2) {
+      swap(cx, ax);
+    }
+    return TRUE;
+  }
+  *cy = rect->y;
+  *ay = rect->y + rect->height;
+  if (ydist1 > ydist2) {
+    swap(cy, ay);
+  }
+  return FALSE;
+}
+
+static void
+rwos_sample(GeglSampler *sampler,
+            const GeglRandom *rand,
+            const GeglRectangle* rect,
+            const gint steps,
+            const gint x,
+            const gint y,
+            gint* n,
+            gfloat out[4])
+{
+  gfloat sx = x, sy = y, dist;
+  for (gint i = 0; i < steps; i++)
+  {
+    gfloat rx, ry;
+    random_unit_vector(rand, x, y, n, &rx, &ry);
+    dist = distance_to_rectangle(rect, sx, sy);
+    sx += dist * rx;
+    sy += dist * ry;
+    if (dist < 1) break;
+  }
+  gfloat cx, cy, ax, ay;
+  closest_and_antipode_on_rectangle(rect, sx, sy, &cx, &cy, &ax, &ay);
+  GeglBufferMatrix2  scale;
+
+  gfloat closest[4];
+  gfloat antipode[4];
+  gegl_sampler_get (sampler, cx, cy, &scale, closest, GEGL_ABYSS_CLAMP);
+  gegl_sampler_get (sampler, ax, ay, &scale, antipode, GEGL_ABYSS_CLAMP);
+
+  for (gint i=0; i<4; i++)
+    out[i] = (closest[i]-antipode[i]) / 2;
 }
 
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
          GeglBuffer          *output,
-         const GeglRectangle *roi,
+         const GeglRectangle *result,
          gint                 level)
 {
-  /*
-  const Babl   *format = gegl_operation_get_format (operation, "input");
+  GeglProperties *o = GEGL_PROPERTIES (operation);
 
-  GeglSampler        *sampler;
-  GeglBufferIterator *iter;
-  gint                x, y;
+  GeglRectangle            boundary     = get_effective_area (operation);
+  const Babl              *format       = gegl_operation_get_format (operation, "output");
+  GeglSampler             *sampler      = gegl_buffer_sampler_new_at_level (
+                                    input, format, GEGL_SAMPLER_NEAREST,
+                                    level);
 
-  sampler = gegl_buffer_sampler_new_at_level (input, format,
-                                              GEGL_SAMPLER_CUBIC, level);
+  gint      x,y;
+  gfloat   *src_buf, *dst_buf;
+  gfloat    dest[4];
+  gint      i, j, offset = 0;
+  GeglRandom* rand = gegl_random_new_with_seed(o->seed);
 
-  iter = gegl_buffer_iterator_new (output, roi, level, format,
-                                   GEGL_ACCESS_WRITE, GEGL_ABYSS_NONE, 2);
+  gint samples = o->samples;
+  gint steps = o->steps;
 
-  gegl_buffer_iterator_add (iter, input, roi, level, format,
-                            GEGL_ACCESS_READ, GEGL_ABYSS_NONE);
+  src_buf = g_new0 (gfloat, result->width * result->height * 4);
+  dst_buf = g_new0 (gfloat, result->width * result->height * 4);
 
-  while (gegl_buffer_iterator_next (iter))
-    {
-      gfloat *out_pixel = iter->items[0].data;
-      gfloat *in_pixel  = iter->items[1].data;
+  gegl_buffer_get (input, result, 1.0, format, src_buf, GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_CLAMP);
+  
+  GeglBufferMatrix2  scale;
 
-      for (y = iter->items[0].roi.y; y < iter->items[0].roi.y + iter->items[0].roi.height; y++)
-        {
+  for (y = result->y; y < result->y + result->height; y++)
+    for (x = result->x; x < result->x + result->width; x++)
+      {
+        gint n = 0;
+        gegl_sampler_get (sampler, x, y, &scale, dest, GEGL_ABYSS_CLAMP);
 
-          for (x = iter->items[0].roi.x; x < iter->items[0].roi.x + iter->items[0].roi.width; x++)
-            {
-              gegl_sampler_get (sampler, x, y, NULL, out_pixel, GEGL_ABYSS_NONE);
+        for (i = 0; i < samples; i++) {
+          gfloat smp[4];
+          rwos_sample(sampler, rand, &boundary, steps, x, y, &n, smp);
 
-              out_pixel += 4;
-              in_pixel  += 4;
-            }
+          for (j=0; j<4; j++)
+            dest[j] -= smp[j] / samples;
         }
-    }
+
+        for (i=0; i<4; i++)
+          dst_buf[offset++] = dest[i];
+      }
+
+  gegl_buffer_set (output, result, 0, format, dst_buf, GEGL_AUTO_ROWSTRIDE);
+
+  g_free (src_buf);
+  g_free (dst_buf);
 
   g_object_unref (sampler);
+  gegl_random_free (rand);
 
-*/
   return  TRUE;
+}
+
+static GeglRectangle
+get_required_for_output (GeglOperation       *operation,
+                         const gchar         *input_pad,
+                         const GeglRectangle *roi)
+{
+  const GeglRectangle *in_rect =
+            gegl_operation_source_get_bounding_box (operation, "input");
+
+  if (! in_rect || gegl_rectangle_is_infinite_plane (in_rect))
+    {
+      return *roi;
+    }
+
+  return *in_rect;
+}
+
+static gboolean
+operation_process (GeglOperation        *operation,
+                   GeglOperationContext *context,
+                   const gchar          *output_prop,
+                   const GeglRectangle  *result,
+                   gint                  level)
+{
+  GeglOperationClass  *operation_class;
+
+  const GeglRectangle *in_rect =
+    gegl_operation_source_get_bounding_box (operation, "input");
+
+  if (in_rect && gegl_rectangle_is_infinite_plane (in_rect))
+    {
+      gpointer in = gegl_operation_context_get_object (context, "input");
+      gegl_operation_context_take_object (context, "output",
+                                          g_object_ref (G_OBJECT (in)));
+      return TRUE;
+    }
+
+  operation_class = GEGL_OPERATION_CLASS (gegl_op_parent_class);
+
+  return operation_class->process (operation, context, output_prop, result,
+                                   gegl_operation_context_get_level (context));
 }
 
 
@@ -109,36 +235,19 @@ gegl_op_class_init (GeglOpClass *klass)
 {
   GeglOperationClass       *operation_class;
   GeglOperationFilterClass *filter_class;
-  gchar                    *composition =
-    "<?xml version='1.0' encoding='UTF-8'?>"
-    "<gegl>"
-    "  <node operation='gegl:crop' width='200' height='200'/>"
-    "  <node operation='gegl:over'>"
-    "    <node operation='gegl:seamkiller'/>"
-    "    <node operation='gegl:threshold'/>"
-    "    <node operation='gegl:load' path='standard-input.png'/>"
-    "  </node>"
-    "  <node operation='gegl:checkerboard'>"
-    "    <params>"
-    "      <param name='color1'>rgb(0.25,0.25,0.25)</param>"
-    "      <param name='color2'>rgb(0.75,0.75,0.75)</param>"
-    "    </params>"
-    "  </node>"    
-    "</gegl>";
 
   operation_class          = GEGL_OPERATION_CLASS (klass);
   filter_class             = GEGL_OPERATION_FILTER_CLASS (klass);
 
-  operation_class->prepare          = prepare;
-  operation_class->get_bounding_box = get_bounding_box;
-  filter_class->process             = process;
+  operation_class->get_required_for_output = get_required_for_output;
+  operation_class->process                 = operation_process;
+
+  filter_class->process = process;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:seamkiller",
     "title",       _("Seamkiller"),
     "categories",  "map",
-    "license",     "CC0",
-    "reference-composition", composition,
     "description", _("Use periodic + smooth decomposition to remove tiling seams"),
     NULL);
 }
